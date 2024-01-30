@@ -13,6 +13,8 @@ import {
   MerkleTree,
   MerkleWitness,
   Struct,
+  Bool,
+  Provable,
 } from 'o1js';
 
 const doProofs = true;
@@ -57,14 +59,76 @@ export class MessageManager extends SmartContract {
   }
 
   @method depositMessage(address: Address, message: Message, eligibleAddressPath: ElligibleAddressMerkleWitness, messagePath: MessageMerkleWitness) {
-    // we fetch the on-chain commitment for the Elligible Addresses Merkle Tree
+    // we fetch the on-chain commitment for the Eligible Addresses Merkle Tree
     this.eligibleAddressesCommitment.requireEquals(this.eligibleAddressesCommitment.get());
 
-    // we check that the address is within the committed Elligible Addresses Merkle Tree
+    // we check that the address is within the committed Eligible Addresses Merkle Tree
     eligibleAddressPath.calculateRoot(address.hash()).assertEquals(this.eligibleAddressesCommitment.get());
 
-    // Validate the message against the other criteria
-    // ...
+    // Enforce flag rules
+    const flags: Bool[] = message.data.toBits().slice(0, 6).reverse();
+    const f1 = flags[0];
+    const f2 = flags[1];
+    const f3 = flags[2];
+    const f4 = flags[3];
+    const f5 = flags[4];
+    const f6 = flags[5];
+
+    //  111011
+
+    console.log("f1:")
+    Provable.log(f1)
+    console.log("f2:")
+    Provable.log(f2)
+    console.log("f3:")
+    Provable.log(f3)
+    console.log("f4:")
+    Provable.log(f4)
+    console.log("f5:")
+    Provable.log(f5)
+    console.log("f6:")
+    Provable.log(f6)
+
+    console.log('checking  - If flag 1 is true, then all other flags must be false: ')
+    Provable.log(Bool.or(
+      f1.not(),
+      Bool.and(f2.not(),
+        Bool.and(f3.not(),
+          Bool.and(f4.not(),
+            Bool.and(f5.not(),
+              f6.not())
+          )
+        )
+      )
+    ))
+
+    // If flag 1 is true, then all other flags must be false
+    Bool.or(
+      f1.not(),
+      Bool.and(f2.not(),
+        Bool.and(f3.not(),
+          Bool.and(f4.not(),
+            Bool.and(f5.not(),
+              f6.not())
+          )
+        )
+      )
+    ).assertTrue("flag 1 is true, and all other flags are not false");
+
+    // If flag 2 is true, then flag 3 must also be true.
+    Bool.or(
+      f2.not(),
+      Bool.and(f2, f3)
+    ).assertTrue("flag 2 is true, and flag 3 is not true");
+
+    // If flag 4 is true, then flags 5 and 6 must be false.
+    Bool.or(
+      f4.not(),
+      Bool.and(
+        f5.not(),
+        f6.not()
+      )
+    ).assertTrue("flag 4 is true, and either flag 5 and 6 are not false");
 
     // we calculate the new Merkle Root and set it
     let newCommitment = messagePath.calculateRoot(message.hash());
@@ -113,7 +177,11 @@ console.log('Adding an eligible address..');
 await addEligibleAddress(Local.testAccounts[1].publicKey);
 
 console.log('Depositing a message..');
-await depositMessage(Local.testAccounts[1].publicKey, Field(123));
+await depositMessage(Local.testAccounts[1].publicKey, Field(32)); // 0b100000 - Passes all tests
+// await depositMessage(Local.testAccounts[1].publicKey, Field(33)); // 0b100001 - Fails test 1
+// await depositMessage(Local.testAccounts[1].publicKey, Field(16)); // 0b010000 - Fails test 2
+// await depositMessage(Local.testAccounts[1].publicKey, Field(5)); // 0b000101 - Fails test 3
+
 
 console.log('Message Deposited!')
 
