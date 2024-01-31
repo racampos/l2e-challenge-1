@@ -8,8 +8,9 @@ import {
   MerkleTree,
   MerkleWitness,
   Struct,
-  // fetchEvents,
   UInt32,
+  MerkleMap,
+  Nullifier,
 } from 'o1js';
 import { MessageManager } from './SecretMessages';
 
@@ -40,7 +41,7 @@ class Message extends Struct({
 
 const proofsEnabled = false;
 
-describe('SecretMessages.test.js', () => {
+describe('MessageManager.test.ts', () => {
   let zkApp: MessageManager,
     zkAppAddress: PublicKey,
     zkAppPrivKey: PrivateKey,
@@ -50,10 +51,9 @@ describe('SecretMessages.test.js', () => {
     messages: Map<PublicKey, Field>,
     eligibleAddresses: Array<PublicKey>,
     messageTree: MerkleTree,
-    eligibleAddressesTree: MerkleTree;
-  // elligibleAddressMerkleWitness: ElligibleAddressMerkleWitness extends
-  //   typeof MerkleWitness,
-  // messageMerkleWitness: MessageMerkleWitness extends typeof MerkleWitness;
+    eligibleAddressesTree: MerkleTree,
+    nullifier: Nullifier,
+    nullifierTree: MerkleMap;
 
   beforeAll(async () => {
     proofsEnabled && (await MessageManager.compile());
@@ -68,44 +68,38 @@ describe('SecretMessages.test.js', () => {
       const publicKey = privateKey.toPublicKey();
       senderAccounts.push({ privateKey, publicKey });
     }
+  });
 
+  async function localDeploy() {
+    const nullifierMessage = Field(5);
     messageTree = new MerkleTree(8);
     eligibleAddressesTree = new MerkleTree(8);
-  });
+    nullifierTree = new MerkleMap();
 
-  beforeEach(async () => {
-    const localBlockchain = Mina.LocalBlockchain({ proofsEnabled });
-    Mina.setActiveInstance(localBlockchain);
-    ({ privateKey: deployerAccPrivKey, publicKey: deployerAcc } =
-      localBlockchain.testAccounts[0]);
+    const jsonNullifier = Nullifier.createTestNullifier(
+      [nullifierMessage],
+      deployerAccPrivKey
+    );
 
-    eligibleAddresses = new Array<PublicKey>();
-    messages = new Map<PublicKey, Field>();
+    nullifier = Nullifier.fromJSON(jsonNullifier);
 
-    zkAppPrivKey = PrivateKey.random();
-    zkAppAddress = zkAppPrivKey.toPublicKey();
-    zkApp = new MessageManager(zkAppAddress);
-  });
-
-  async function localDeploy(prove: boolean = false, wait: boolean = false) {
     const txn = await Mina.transaction(deployerAcc, () => {
       AccountUpdate.fundNewAccount(deployerAcc);
       zkApp.deploy({ zkappKey: zkAppPrivKey });
-    });
-    prove = true;
-    if (prove) {
-      await txn.prove();
-    }
-    // this tx needs .sign(), because `deploy()` adds an account update that requires signature authorization
-    // const txPromise = await txn.sign([deployerAccPrivKey, zkAppPrivKey]).send();
-    await txn.sign([deployerAccPrivKey, zkAppPrivKey]).send();
 
-    if (wait) {
-      // await txPromise.wait();
-    }
+      zkApp.nullifierRoot.set(nullifierTree.getRoot());
+      zkApp.nullifierMessage.set(nullifierMessage);
+      zkApp.eligibleAddressesCommitment.set(Field(0));
+      zkApp.messagesCommitment.set(Field(0));
+    });
+    await txn.prove();
+    await txn.sign([deployerAccPrivKey, zkAppPrivKey]).send();
   }
 
-  function initAddEligibleAddress(a: PublicKey) {
+  function initAddEligibleAddress(
+    a: PublicKey,
+    eligibleAddresses: Array<PublicKey>
+  ) {
     const eligibleAddressesLeafCount = BigInt(eligibleAddresses.length);
     const w = eligibleAddressesTree.getWitness(eligibleAddressesLeafCount);
 
@@ -114,6 +108,7 @@ describe('SecretMessages.test.js', () => {
     eligibleAddressesTree.setLeaf(eligibleAddressesLeafCount, address.hash());
 
     return {
+      newEligibleAddresses: eligibleAddresses,
       address,
       witness,
     };
@@ -124,8 +119,15 @@ describe('SecretMessages.test.js', () => {
     // eligibleAddressesTree.setLeaf(eligibleAddressesLeafCount, address.hash());
   }
 
-  async function initDepositMessage(a: PublicKey, m: Field) {
+  async function initDepositMessage(
+    a: PublicKey,
+    m: Field,
+    voidAddressCheck = false
+  ) {
     const addressIndex = eligibleAddresses.indexOf(a);
+    if (!voidAddressCheck && addressIndex === -1) {
+      throw new Error('Address not found in eligibleAddresses');
+    }
     const aw = eligibleAddressesTree.getWitness(BigInt(addressIndex));
 
     const addressWitness = new ElligibleAddressMerkleWitness(aw);
@@ -145,7 +147,85 @@ describe('SecretMessages.test.js', () => {
     };
   }
 
+  async function performAddEligibleAddress(senderAcc: PublicKey) {
+    const { address, witness, newEligibleAddresses } = initAddEligibleAddress(
+      senderAcc,
+      eligibleAddresses
+    );
+
+    const tx = await Mina.transaction(deployerAcc, () => {
+      zkApp.addEligibleAddress(address, witness);
+    });
+    await tx.prove();
+    await tx.sign([deployerAccPrivKey]).send();
+
+    eligibleAddresses.push(senderAcc);
+
+    return { address, witness, newEligibleAddresses };
+  }
+
+  async function performDepositMessage(senderAcc: PublicKey, message: Field) {
+    const {
+      address,
+      message: msg,
+      addressWitness,
+      messageWitness,
+    } = await initDepositMessage(senderAcc, message);
+
+    const tx = await Mina.transaction(deployerAcc, () => {
+      zkApp.depositMessage(
+        address,
+        msg,
+        addressWitness,
+        messageWitness,
+        nullifier
+      );
+    });
+    await tx.prove();
+    await tx.sign([deployerAccPrivKey]).send();
+
+    messages.set(senderAcc, message);
+    messageTree.setLeaf(BigInt(messages.size), msg.hash());
+  }
+
+  async function handleMultipleAddEligibleAddresses(
+    accounts: Array<SenderAccountInfo>
+  ) {
+    for (const senderAcc of accounts) {
+      const { address, witness } = initAddEligibleAddress(
+        senderAcc.publicKey,
+        eligibleAddresses
+      );
+
+      const txAdd = await Mina.transaction(deployerAcc, () => {
+        zkApp.addEligibleAddress(address, witness);
+      });
+
+      await txAdd.prove();
+      await txAdd.sign([deployerAccPrivKey, zkAppPrivKey]).send();
+
+      // After the transaction is sent and confirmed, push the publicKey to eligibleAddresses
+      eligibleAddresses.push(senderAcc.publicKey);
+    }
+
+    return eligibleAddresses;
+  }
+
   describe('MessageManager.test.ts', () => {
+    beforeEach(async () => {
+      const localBlockchain = Mina.LocalBlockchain({ proofsEnabled });
+      Mina.setActiveInstance(localBlockchain);
+      ({ privateKey: deployerAccPrivKey, publicKey: deployerAcc } =
+        localBlockchain.testAccounts[0]);
+
+      eligibleAddresses = new Array<PublicKey>();
+      messages = new Map<PublicKey, Field>();
+
+      zkAppPrivKey = PrivateKey.random();
+      zkAppAddress = zkAppPrivKey.toPublicKey();
+      zkApp = new MessageManager(zkAppAddress);
+    });
+
     it('generates and deploys MessageManager contract', async () => {
       await localDeploy();
       const eligibleAddressesCommitment =
@@ -156,44 +236,52 @@ describe('SecretMessages.test.js', () => {
     it('should be able to add an address to registered addresses', async () => {
       await localDeploy();
       const senderAcc = senderAccounts[0].publicKey;
-      const { address, witness } = await initAddEligibleAddress(senderAcc);
+      const { address, witness } = initAddEligibleAddress(
+        senderAcc,
+        eligibleAddresses
+      );
 
       expect(async () => {
-        await Mina.transaction(deployerAcc, () => {
+        const tx = await Mina.transaction(deployerAcc, () => {
           zkApp.addEligibleAddress(address, witness);
         });
-      }).resolves;
+        await tx.prove();
+        await tx.sign([deployerAccPrivKey]).send();
+      });
     });
 
     it('a registered address can deposit a correct message', async () => {
       await localDeploy();
       const senderAcc = senderAccounts[0].publicKey;
-      const { address, witness } = await initAddEligibleAddress(senderAcc);
 
-      await Mina.transaction(deployerAcc, () => {
-        zkApp.addEligibleAddress(address, witness);
-      });
+      const { address } = await performAddEligibleAddress(senderAcc);
 
       const m = Field(32);
       const { message, addressWitness, messageWitness } =
         await initDepositMessage(senderAcc, m);
 
       expect(async () => {
-        await Mina.transaction(deployerAcc, () => {
+        const tx = await Mina.transaction(deployerAcc, () => {
           zkApp.depositMessage(
             address,
             message,
             addressWitness,
-            messageWitness
+            messageWitness,
+            nullifier
           );
         });
-      }).resolves;
+        await tx.prove();
+        return await tx.sign([deployerAccPrivKey]).send();
+      });
     });
 
     it('an event is emitted when a correct message is deposited', async () => {
       await localDeploy();
       const senderAcc = senderAccounts[0].publicKey;
-      const { address, witness } = initAddEligibleAddress(senderAcc);
+      const { address, witness } = initAddEligibleAddress(
+        senderAcc,
+        eligibleAddresses
+      );
 
       const tx1 = await Mina.transaction(deployerAcc, () => {
         zkApp.addEligibleAddress(address, witness);
@@ -208,7 +296,13 @@ describe('SecretMessages.test.js', () => {
         await initDepositMessage(senderAcc, m);
 
       const tx2 = await Mina.transaction(deployerAcc, () => {
-        zkApp.depositMessage(address, message, addressWitness, messageWitness);
+        zkApp.depositMessage(
+          address,
+          message,
+          addressWitness,
+          messageWitness,
+          nullifier
+        );
       });
       await tx2.prove();
       await tx2.sign([deployerAccPrivKey]).send();
@@ -222,203 +316,192 @@ describe('SecretMessages.test.js', () => {
       const eventField = event.event.data.toFields(null)[0];
 
       eventField.assertEquals(message.data);
-      // event.event.data.check(event.event.data);
     });
 
     it('any randomly selected registered address (out of 100) can deposit a valid message', async () => {
       await localDeploy();
 
-      // const txs = [];
+      return handleMultipleAddEligibleAddresses(senderAccounts).then(
+        async (addresses) => {
+          expect(addresses.length).toEqual(senderAccounts.length);
 
-      senderAccounts.map(async (senderAcc) => {
-        const { address, witness } = initAddEligibleAddress(
-          senderAcc.publicKey
-        );
+          const appCommitment = zkApp.eligibleAddressesCommitment.get();
 
-        eligibleAddresses.push(senderAcc.publicKey);
+          appCommitment.assertEquals(eligibleAddressesTree.getRoot());
 
-        const txAdd = await Mina.transaction(deployerAcc, () => {
-          zkApp.addEligibleAddress(address, witness);
-        });
-        await txAdd.prove();
-        const sent = await txAdd
-          .sign([deployerAccPrivKey, zkAppPrivKey])
-          .send();
-        // .then(() => {
-        //   console.log(':(((((');
-        //   eligibleAddresses.push(senderAcc.publicKey);
-        // });
+          const randomIndex = Math.floor(Math.random() * addresses.length);
 
-        // await sent.wait();
+          const randomPublicKy = addresses[randomIndex];
+          const m = Field(32);
 
-        // return txAdd;
-      });
+          const { address, message, addressWitness, messageWitness } =
+            await initDepositMessage(randomPublicKy, m);
 
-      // console.log('txs.length', txs.length);
-      // console.log('eligibleAddresses.length', eligibleAddresses.length);
+          const depositMsg = await Mina.transaction(deployerAcc, () => {
+            zkApp.depositMessage(
+              address,
+              message,
+              addressWitness,
+              messageWitness,
+              nullifier
+            );
+          });
 
-      // await Promise.all(txs);
+          await depositMsg.prove();
+          await depositMsg.sign([deployerAccPrivKey]).send();
+          const events = await zkApp.fetchEvents(
+            UInt32.from(0),
+            UInt32.from(1)
+          );
 
-      // for (let i = 0; i < 10; i++) {
-      //   let start = i * 5;
-      //   let end = start + 4;
+          expect(events.length).toBeGreaterThanOrEqual(1);
 
-      //   const txAdd = await Mina.transaction(deployerAcc, () => {
-      //     console.log('start', start);
-      //     console.log('end', end);
-      //     for (let j = start; j <= end; j++) {
-      //       console.log('j', j);
-      //       const senderAcc = senderAccounts[j].publicKey;
-      //       const { address, witness } = initAddEligibleAddress(senderAcc);
-      //       eligibleAddresses.push(senderAcc);
-      //       zkApp.addEligibleAddress(address, witness);
-      //     }
-      //   });
+          const event = events[0];
 
-      //   // txs.push(txAdd);
+          const eventField = event.event.data.toFields(null)[0];
 
-      //   await txAdd.prove();
-      //   await txAdd.sign([deployerAccPrivKey, zkAppPrivKey]).send();
-
-      //   console.log('eligibleAddresses.length', eligibleAddresses.length);
-      // }
-
-      // const readyTxs = await Promise.all(txs);
-
-      // const plz = readyTxs.map((tx) => {
-      //   return [tx.prove(), tx.sign([deployerAccPrivKey, zkAppPrivKey]).send()];
-      // });
-
-      // const results = await Promise.all(plz.flat());
-
-      const appCommitment = zkApp.eligibleAddressesCommitment.get();
-
-      appCommitment.assertEquals(eligibleAddressesTree.getRoot());
-
-      // expect(appCommitment).toEqual(eligibleAddressesTree.getRoot());
-      // )
-      // .sign([deployerAccPrivKey, zkAppPrivKey])
-      // .send();
-      // }
-
-      // const randomIndex = Math.floor(Math.random() * 10);
-      // const senderAcc = senderAccounts[randomIndex].publicKey;
-      // const { address } = initAddEligibleAddress(senderAcc);
-
-      // const m = Field(32);
-      // const { message, addressWitness, messageWitness } =
-      //   await initDepositMessage(senderAcc, m);
-
-      // const tx = await Mina.transaction(deployerAcc, () => {
-      //   zkApp.depositMessage(address, message, addressWitness, messageWitness);
-      // });
-
-      // await tx.sign([deployerAccPrivKey, zkAppPrivKey]).send();
-
-      // expect(tx).resolves;
+          return eventField.assertEquals(message.data);
+        }
+      );
     });
 
-    // describe('Fail Cases', () => {
-    //   let senderAcc: PublicKey;
+    it('should prevent an unregistered address from depositing a message', async () => {
+      await localDeploy();
+      const senderAcc = senderAccounts[0].publicKey;
 
-    //   beforeEach(async () => {
-    //     await localDeploy();
-    //     senderAcc = senderAccounts[0].publicKey;
-    //   });
+      const m = Field(32);
+      const { message, addressWitness, messageWitness } =
+        await initDepositMessage(senderAcc, m, true);
 
-    //   it('should be able to add a user to registered addresses', async () => {
-    //     await localDeploy();
+      // overide 'address' with an unregistered one
+      const privateKey = PrivateKey.random();
+      const publicKey = privateKey.toPublicKey();
+      const unregisteredAddress = new Address({ publicKey: publicKey });
 
-    //     await addEligibleAddress(senderAcc);
-    //   });
+      expect(async () => {
+        await Mina.transaction(deployerAcc, () => {
+          zkApp.depositMessage(
+            unregisteredAddress,
+            message,
+            addressWitness,
+            messageWitness,
+            nullifier
+          );
+        });
+        // await tx.prove();
+        // return await tx.sign([deployerAccPrivKey]).send();
+      }).rejects.toThrow(
+        'address is not in the committed Eligible Addresses Merkle Tree'
+      );
+    });
 
-    //   it('should be able to deposit a message which passes all tests', async () => {
-    //     const validMessage = Field(32); // 0b100000
+    it('should not allow depositing a message that does not complies with rule #1', async () => {
+      await localDeploy();
+      const senderAcc = senderAccounts[0].publicKey;
 
-    //     await initAddEligibleAddress(senderAcc);
+      await performAddEligibleAddress(senderAcc);
 
-    //     zkApp.eligibleAddressesCommitment
-    //       .get()
-    //       .assertEquals(eligibleAddressesTree.getRoot());
+      // This is a wrong message as per the first rule (33 = 0b100001)
+      // namely, if flag 1 is true, then all other flags must be false
+      const wrongMessage = Field(33);
+      const { address, message, addressWitness, messageWitness } =
+        await initDepositMessage(senderAcc, wrongMessage);
 
-    //     const { address, message, addressWitness, messageWitness } =
-    //       await initDepositMessage(senderAcc, validMessage);
+      return expect(async () => {
+        await Mina.transaction(deployerAcc, () => {
+          zkApp.depositMessage(
+            address,
+            message, // This is a wrong message
+            addressWitness,
+            messageWitness,
+            nullifier
+          );
+        });
+      }).rejects.toThrow('flag 1 is true, and all other flags are not false');
+    });
 
-    //     // let tx: Mina.Transaction;
+    it('should not allow depositing a message that does not complies with rule #2', async () => {
+      await localDeploy();
+      const senderAcc = senderAccounts[0].publicKey;
 
-    //     expect(async () => {
-    //       await Mina.transaction(deployerAcc, () => {
-    //         zkApp.depositMessage(
-    //           address,
-    //           message,
-    //           addressWitness,
-    //           messageWitness
-    //         );
-    //       });
-    //     }).resolves;
+      await performAddEligibleAddress(senderAcc);
 
-    //     // if the transaction was successful, we can update our off-chain storage as well
-    //     messages.set(senderAcc, message.hash());
+      // This is a wrong message as per the second rule (16 = 0b010000)
+      // namely, if flag 2 is true, then flag 3 must also be true.
+      const wrongMessage = Field(16);
+      const { address, message, addressWitness, messageWitness } =
+        await initDepositMessage(senderAcc, wrongMessage);
 
-    //     const messagesLeafCount = BigInt(messages.size);
+      return expect(async () => {
+        await Mina.transaction(deployerAcc, () => {
+          zkApp.depositMessage(
+            address,
+            message, // This is a wrong message
+            addressWitness,
+            messageWitness,
+            nullifier
+          );
+        });
+      }).rejects.toThrow('flag 2 is true, and flag 3 is not true');
+    });
 
-    //     messageTree.setLeaf(messagesLeafCount, message.hash());
+    it('should not allow depositing a message that does not complies with rule #3', async () => {
+      await localDeploy();
+      const senderAcc = senderAccounts[0].publicKey;
 
-    //     zkApp.messagesCommitment.get().assertEquals(messageTree.getRoot());
-    //   });
+      await performAddEligibleAddress(senderAcc);
 
-    //   it('Checks that if flag 1 is true, then all other flags must be false', async () => {
-    //     // await localDeploy();
-    //     const validMessage = Field(33); // 0b100001
+      // This is a wrong message as per the third rule (5 = 0b000101)
+      // namely, if flag 4 is true, then flags 5 and 6 must be false.
+      const wrongMessage = Field(5);
+      const { address, message, addressWitness, messageWitness } =
+        await initDepositMessage(senderAcc, wrongMessage);
 
-    //     await addEligibleAddress(senderAcc);
+      return expect(async () => {
+        await Mina.transaction(deployerAcc, () => {
+          zkApp.depositMessage(
+            address,
+            message, // This is a wrong message
+            addressWitness,
+            messageWitness,
+            nullifier
+          );
+        });
+      }).rejects.toThrow(
+        'flag 4 is true, and either flag 5 and 6 are not false'
+      );
+    });
 
-    //     zkApp.eligibleAddressesCommitment
-    //       .get()
-    //       .assertEquals(eligibleAddressesTree.getRoot());
+    it('should prevent an address from depositing a message if it has already deposited one', async () => {
+      await localDeploy();
+      const senderAcc = senderAccounts[0].publicKey;
 
-    //     await depositMessage(senderAcc, validMessage);
+      await performAddEligibleAddress(senderAcc);
 
-    //     zkApp.messagesCommitment.get().assertEquals(messageTree.getRoot());
-    //   });
+      const m = Field(32);
 
-    //   it('Checks that if flag 2 is true, then flag 3 must also be true.', async () => {
-    //     await localDeploy();
-    //   });
+      await performDepositMessage(senderAcc, m);
 
-    //   it('Checks that if flag 4 is true, then flags 5 and 6 must be false.', async () => {
-    //     await localDeploy();
-    //   });
+      const address = new Address({ publicKey: senderAcc });
+      const message = new Message({ publicKey: senderAcc, data: m });
 
-    //   it('', async () => {
-    //     await localDeploy();
-    //   });
-    // });
+      const {
+        addressWitness: newAddressWitness,
+        messageWitness: newMessageWitness,
+      } = await initDepositMessage(senderAcc, m);
+
+      // Attempt to deposit a second message
+      return expect(async () => {
+        await Mina.transaction(deployerAcc, () => {
+          zkApp.depositMessage(
+            address,
+            message,
+            newAddressWitness,
+            newMessageWitness,
+            nullifier
+          );
+        });
+      }).rejects;
+    });
   });
 });
-
-// await depositMessage(Local.testAccounts[1].publicKey, Field(32)); // 0b100000 - Passes all tests
-// await depositMessage(Local.testAccounts[1].publicKey, Field(33)); // 0b100001 - Fails test 1
-// await depositMessage(Local.testAccounts[1].publicKey, Field(16)); // 0b010000 - Fails test 2
-// await depositMessage(Local.testAccounts[1].publicKey, Field(5)); // 0b000101 - Fails test 3
-//
-// it('throws an error if the NFT ID and endorser Hash are correct but the provided signature is invalid', async () => {
-//   const zkAppInstance = new Cpone(zkAppAddress);
-//   await localDeploy(zkAppInstance, zkAppPrivateKey, deployerAccount);
-
-//   const incorrectNftHash = Poseidon.hash([Field(123)]);
-//   const signature = Signature.create(privKey, [
-//     incorrectNftHash,
-//     endorserHash,
-//   ]);
-
-//   expect(async () => {
-//     await Mina.transaction(deployerAccount, () => {
-//       zkAppInstance.verify(
-//         nftHash,
-//         endorserHash,
-//         signature ?? fail('something is wrong with the signature')
-//       );
-//     });
-//   }).rejects;
-// });

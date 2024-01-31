@@ -5,19 +5,15 @@ import {
   State,
   state,
   PublicKey,
-  // Mina,
   method,
-  // PrivateKey,
-  // AccountUpdate,
-  // MerkleTree,
   MerkleWitness,
   Struct,
   Bool,
   Provable,
-  // Provable,
+  Nullifier,
+  MerkleMapWitness,
+  MerkleMap,
 } from 'o1js';
-
-// const doProofs = true;
 
 class ElligibleAddressMerkleWitness extends MerkleWitness(8) {}
 class MessageMerkleWitness extends MerkleWitness(8) {}
@@ -42,16 +38,12 @@ class Message extends Struct({
 export class MessageManager extends SmartContract {
   @state(Field) eligibleAddressesCommitment = State<Field>();
   @state(Field) messagesCommitment = State<Field>();
+  @state(Field) nullifierRoot = State<Field>();
+  @state(Field) nullifierMessage = State<Field>();
 
   events = {
     MessageDeposited: Field,
   };
-
-  @method init() {
-    super.init();
-    this.eligibleAddressesCommitment.set(Field(0));
-    this.messagesCommitment.set(Field(0));
-  }
 
   @method addEligibleAddress(
     address: Address,
@@ -69,16 +61,37 @@ export class MessageManager extends SmartContract {
     address: Address,
     message: Message,
     eligibleAddressPath: ElligibleAddressMerkleWitness,
-    messagePath: MessageMerkleWitness
+    messagePath: MessageMerkleWitness,
+    nullifier: Nullifier
   ) {
+    let nullifierRoot = this.nullifierRoot.getAndRequireEquals();
+    let nullifierMessage = this.nullifierMessage.getAndRequireEquals();
+    // verify the nullifier
+    nullifier.verify([nullifierMessage]);
+
+    let nullifierWitness = Provable.witness(MerkleMapWitness, () =>
+      NullifierTree.getWitness(nullifier.key())
+    );
+
+    // we compute the current root and make sure the entry is set to 0 (= unused)
+    nullifier.assertUnused(nullifierWitness, nullifierRoot);
+
+    // we set the nullifier to 1 (= used) and calculate the new root
+    let newRoot = nullifier.setUsed(nullifierWitness);
+
+    // we update the on-chain root
+    this.nullifierRoot.set(newRoot);
+
     // we fetch the on-chain commitment for the Eligible Addresses Merkle Tree
     const commitment = this.eligibleAddressesCommitment.getAndRequireEquals();
 
     // we check that the address is within the committed Eligible Addresses Merkle Tree
-    eligibleAddressPath.calculateRoot(address.hash()).assertEquals(commitment);
-
-    console.log('before message.data.toBits().slice(0, 6).reverse();');
-    Provable.log(message.data);
+    eligibleAddressPath
+      .calculateRoot(address.hash())
+      .assertEquals(
+        commitment,
+        'address is not in the committed Eligible Addresses Merkle Tree'
+      );
 
     // Enforce flag rules
     const flags: Bool[] = message.data.toBits().slice(0, 6).reverse();
@@ -88,37 +101,6 @@ export class MessageManager extends SmartContract {
     const f4 = flags[3];
     const f5 = flags[4];
     const f6 = flags[5];
-
-    console.log('after  message.data.toBits().slice(0, 6).reverse();');
-    Provable.log(message.data);
-
-    //  111011
-
-    // console.log('f1:');
-    // Provable.log(f1);
-    // console.log('f2:');
-    // Provable.log(f2);
-    // console.log('f3:');
-    // Provable.log(f3);
-    // console.log('f4:');
-    // Provable.log(f4);
-    // console.log('f5:');
-    // Provable.log(f5);
-    // console.log('f6:');
-    // Provable.log(f6);
-
-    // console.log(
-    //   'checking  - If flag 1 is true, then all other flags must be false: '
-    // );
-    // Provable.log(
-    //   Bool.or(
-    //     f1.not(),
-    //     Bool.and(
-    //       f2.not(),
-    //       Bool.and(f3.not(), Bool.and(f4.not(), Bool.and(f5.not(), f6.not())))
-    //     )
-    //   )
-    // );
 
     // If flag 1 is true, then all other flags must be false
     Bool.or(
@@ -149,102 +131,4 @@ export class MessageManager extends SmartContract {
   }
 }
 
-// let Local = Mina.LocalBlockchain({ proofsEnabled: doProofs });
-// Mina.setActiveInstance(Local);
-// let initialBalance = 10_000_000_000;
-
-// let feePayerKey = Local.testAccounts[0].privateKey;
-// let feePayer = Local.testAccounts[0].publicKey;
-
-// // the zkapp account
-// let zkappKey = PrivateKey.random();
-// let zkappAddress = zkappKey.toPublicKey();
-
-// // Off-chain storage for address-message pairs
-// const messages: Map<PublicKey, Field> = new Map<PublicKey, Field>();
-
-// // Off-chain storage for eligible addresses
-// const eligibleAddresses: Array<PublicKey> = new Array<PublicKey>();
-
-// // we now need "wrap" the Merkle tree around our off-chain storage
-// // we initialize a new Merkle Tree with height 8
-// const EligibleAddressTree = new MerkleTree(8);
-// const MessageTree = new MerkleTree(8);
-
-// let messageManagerZkApp = new MessageManager(zkappAddress);
-// console.log('Deploying Message Manager..');
-// if (doProofs) {
-//   await MessageManager.compile();
-// }
-// let tx = await Mina.transaction(feePayer, () => {
-//   AccountUpdate.fundNewAccount(feePayer).send({
-//     to: zkappAddress,
-//     amount: initialBalance,
-//   });
-//   messageManagerZkApp.deploy();
-// });
-// await tx.prove();
-// await tx.sign([feePayerKey, zkappKey]).send();
-
-// console.log('Adding an eligible address..');
-// await addEligibleAddress(Local.testAccounts[1].publicKey);
-
-// console.log('Depositing a message..');
-// await depositMessage(Local.testAccounts[1].publicKey, Field(32)); // 0b100000 - Passes all tests
-// // await depositMessage(Local.testAccounts[1].publicKey, Field(33)); // 0b100001 - Fails test 1
-// // await depositMessage(Local.testAccounts[1].publicKey, Field(16)); // 0b010000 - Fails test 2
-// // await depositMessage(Local.testAccounts[1].publicKey, Field(5)); // 0b000101 - Fails test 3
-
-// console.log('Message Deposited!');
-
-// async function addEligibleAddress(a: PublicKey) {
-//   const eligibleAddressesLeafCount = BigInt(eligibleAddresses.length);
-//   const w = EligibleAddressTree.getWitness(eligibleAddressesLeafCount);
-
-//   const witness = new ElligibleAddressMerkleWitness(w);
-//   const address = new Address({ publicKey: a });
-//   const tx = await Mina.transaction(feePayer, () => {
-//     messageManagerZkApp.addEligibleAddress(address, witness);
-//   });
-//   await tx.prove();
-//   await tx.sign([feePayerKey, zkappKey]).send();
-
-//   // if the transaction was successful, we can update our off-chain storage as well
-//   eligibleAddresses.push(a);
-//   // EligibleAddressTree.setLeaf(index.toBigInt(), address.hash());
-//   EligibleAddressTree.setLeaf(eligibleAddressesLeafCount, address.hash());
-//   messageManagerZkApp.eligibleAddressesCommitment
-//     .get()
-//     .assertEquals(EligibleAddressTree.getRoot());
-// }
-
-// async function depositMessage(a: PublicKey, m: Field) {
-//   const addressIndex = eligibleAddresses.indexOf(a);
-//   const aw = EligibleAddressTree.getWitness(BigInt(addressIndex));
-
-//   const addressWitness = new ElligibleAddressMerkleWitness(aw);
-
-//   const messagesLeafCount = BigInt(messages.size);
-//   let mw = MessageTree.getWitness(messagesLeafCount);
-//   const messageWitness = new MessageMerkleWitness(mw);
-
-//   const address = new Address({ publicKey: a });
-//   const message = new Message({ publicKey: a, data: m });
-//   const tx = await Mina.transaction(feePayer, () => {
-//     messageManagerZkApp.depositMessage(
-//       address,
-//       message,
-//       addressWitness,
-//       messageWitness
-//     );
-//   });
-//   await tx.prove();
-//   await tx.sign([feePayerKey, zkappKey]).send();
-
-//   // if the transaction was successful, we can update our off-chain storage as well
-//   messages.set(a, m);
-//   MessageTree.setLeaf(messagesLeafCount, message.hash());
-//   messageManagerZkApp.messagesCommitment
-//     .get()
-//     .assertEquals(MessageTree.getRoot());
-// }
+export const NullifierTree = new MerkleMap();
