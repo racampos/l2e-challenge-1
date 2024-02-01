@@ -46,7 +46,7 @@ Using the Zed IDE, we were able to collaborate in real-time, which significantly
 
 Here is a screenshot of how the Zed IDE looks like:
 
-<img alt="zed-collaboration" src="docs/img/zed-collaboration.png" width="600">
+<img alt="zed-collaboration" src="docs/img/zed-collaboration.png" width="800">
 
 
 © 2024 racampos and 0xtito
