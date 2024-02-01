@@ -211,7 +211,7 @@ describe('MessageManager.test.ts', () => {
     return eligibleAddresses;
   }
 
-  describe('MessageManager.test.ts', () => {
+  describe('MessageManager', () => {
     beforeEach(async () => {
       const localBlockchain = Mina.LocalBlockchain({ proofsEnabled });
       Mina.setActiveInstance(localBlockchain);
@@ -388,8 +388,6 @@ describe('MessageManager.test.ts', () => {
             nullifier
           );
         });
-        // await tx.prove();
-        // return await tx.sign([deployerAccPrivKey]).send();
       }).rejects.toThrow(
         'address is not in the committed Eligible Addresses Merkle Tree'
       );
@@ -470,6 +468,67 @@ describe('MessageManager.test.ts', () => {
       }).rejects.toThrow(
         'flag 4 is true, and either flag 5 and 6 are not false'
       );
+    });
+
+    it('shoould not allow more than 100 eligible addresses', async () => {
+      await localDeploy();
+
+      await handleMultipleAddEligibleAddresses(senderAccounts).then(
+        async (addresses) => {
+          expect(addresses.length).toEqual(senderAccounts.length);
+
+          const appCommitment = zkApp.eligibleAddressesCommitment.get();
+
+          appCommitment.assertEquals(eligibleAddressesTree.getRoot());
+
+          const randomIndex = Math.floor(Math.random() * addresses.length);
+
+          const randomPublicKy = addresses[randomIndex];
+          const m = Field(32);
+
+          const { address, message, addressWitness, messageWitness } =
+            await initDepositMessage(randomPublicKy, m);
+
+          const depositMsg = await Mina.transaction(deployerAcc, () => {
+            zkApp.depositMessage(
+              address,
+              message,
+              addressWitness,
+              messageWitness,
+              nullifier
+            );
+          });
+
+          await depositMsg.prove();
+          await depositMsg.sign([deployerAccPrivKey]).send();
+          const events = await zkApp.fetchEvents(
+            UInt32.from(0),
+            UInt32.from(1)
+          );
+
+          expect(events.length).toBeGreaterThanOrEqual(1);
+
+          const event = events[0];
+
+          const eventField = event.event.data.toFields(null)[0];
+
+          return eventField.assertEquals(message.data);
+        }
+      );
+
+      const newAccPriv = PrivateKey.random();
+      const newAccPub = newAccPriv.toPublicKey();
+
+      const { address, witness } = initAddEligibleAddress(
+        newAccPub,
+        eligibleAddresses
+      );
+
+      return expect(async () => {
+        await Mina.transaction(deployerAcc, () => {
+          zkApp.addEligibleAddress(address, witness);
+        });
+      }).rejects.toThrow('Maximum number of eligible addresses reached');
     });
 
     it('should prevent an address from depositing a message if it has already deposited one', async () => {
