@@ -51,7 +51,10 @@ export class MessageManager extends SmartContract {
   ) {
     // Validate that there is room for another address (i.e. there are less than 100 addresses)
     const count = path.calculateIndex();
-    count.assertLessThan(Field(100));
+    count.assertLessThan(
+      Field(100),
+      'Maximum number of eligible addresses reached'
+    );
 
     let newCommitment = path.calculateRoot(address.hash());
     this.eligibleAddressesCommitment.set(newCommitment);
